@@ -1,0 +1,697 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+#from comet_ml import Experiment
+#experiment = Experiment()
+
+
+# In[ ]:
+
+
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.autograd import Variable
+from torch.utils.data import Dataset, DataLoader
+from torchvision.datasets import ImageFolder
+from torchvision import transforms
+from torchvision.utils import save_image
+from torch import einsum
+from einops import rearrange
+from tqdm import tqdm
+from PIL import Image, ImageFile
+from pickle import load, dump
+import random
+import cv2
+import time
+import argparse
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+# In[ ]:
+
+
+class WeightScaledConv2d(nn.Module):
+    def __init__(self, input_nc, output_nc, kernel_size, stride=1, padding=0, groups=1):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(output_nc, input_nc//groups, kernel_size, kernel_size))
+        self.scale = np.sqrt(2 / (input_nc * kernel_size ** 2))
+        self.stride = stride
+        self.padding = padding
+        self.groups = groups
+
+        self.upsample = False
+        
+    def deconv(self):
+        self.upsample = True
+        return self
+    
+    def forward(self, x):
+        weight = self.weight * self.scale
+        if not self.upsample:
+            out = F.conv2d(x, weight=weight, stride=self.stride, padding=self.padding, groups=self.groups)
+        else:
+            weight = weight.transpose(0, 1)
+            out = F.conv_transpose2d(x, weight=weight, stride=self.stride, padding=self.padding, groups=self.groups)
+        return out
+
+
+# In[ ]:
+
+
+class WeightScaledLinear(nn.Module):
+    def __init__(self, input_nc, output_nc, bias=False):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(output_nc, input_nc))
+        self.scale = np.sqrt(2 / input_nc)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(output_nc))
+        else:
+            self.bias = None
+    
+    def forward(self, x):
+        weight = self.weight * self.scale
+        out = F.linear(x, weight=weight, bias=self.bias)
+        return out
+
+
+# In[ ]:
+
+
+class GLU(nn.Module):
+    def forward(self, x):
+        channel = x.size(1)
+        assert channel % 2 == 0, 'must divide by 2.'
+        return x[:, :channel//2] * torch.sigmoid(x[:, channel//2:])
+
+
+# In[ ]:
+
+
+class FReLU(nn.Module):
+    def __init__(self, n_channel, kernel=3, stride=1, padding=1):
+        super().__init__()
+        self.funnel_condition = WeightScaledConv2d(n_channel, n_channel, kernel_size=kernel,stride=stride, padding=padding, groups=n_channel)
+        self.bn = nn.BatchNorm2d(n_channel)
+
+    def forward(self, x):
+        tx = self.bn(self.funnel_condition(x))
+        out = torch.max(x, tx)
+        return out
+
+
+# In[ ]:
+
+
+class Mish(nn.Module):
+    @staticmethod
+    def mish(x):
+        return x * torch.tanh(F.softplus(x))
+    
+    def forward(self, x):
+        return Mish.mish(x)
+
+
+# In[ ]:
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, input_nc):
+        super().__init__()
+        
+        # Pointwise Convolution
+        self.query_conv = nn.Conv2d(input_nc, input_nc // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(input_nc, input_nc // 8, kernel_size=1)
+        self.value_conv = nn.Conv2d(input_nc, input_nc, kernel_size=1)
+        
+        self.softmax = nn.Softmax(dim=-2)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x, return_map=False):
+        proj_query = self.query_conv(x).view(x.shape[0], -1, x.shape[2] * x.shape[3]).permute(0, 2, 1)
+        proj_key = self.key_conv(x).view(x.shape[0], -1, x.shape[2] * x.shape[3])
+        s = torch.bmm(proj_query, proj_key)
+        attention_map_T = self.softmax(s)
+        
+        proj_value = self.value_conv(x).view(x.shape[0], -1, x.shape[2] * x.shape[3])
+        o = torch.bmm(proj_value, attention_map_T)
+        
+        o = o.view(x.shape[0], x.shape[1], x.shape[2], x.shape[3])
+        out = x + self.gamma * o
+        
+        if return_map:
+            return out, attention_map_T.permute(0, 2, 1)
+        else:
+            return out
+
+
+# In[ ]:
+
+
+class PixelwiseNormalization(nn.Module):
+    def pixel_norm(self, x):
+        eps = 1e-8
+        return x * torch.rsqrt(torch.mean(x * x, 1, keepdim=True) + eps)
+    
+    def forward(self, x):
+        return self.pixel_norm(x)
+
+
+# In[ ]:
+
+
+class ModulatedConv2d(nn.Module):
+    def __init__(self, input_nc, output_nc, dim_latent, kernel_size, stride=1, padding=0):
+        super().__init__()
+        
+        self.epsilon = 1e-8
+        self.stride = stride
+        self.padding = padding
+        
+        self.norm = nn.InstanceNorm2d(input_nc)
+        self.weight = nn.Parameter(torch.randn([1, output_nc, input_nc, kernel_size, kernel_size]))
+        self.scale = np.sqrt(2 / (input_nc * kernel_size ** 2))
+        self.modulate = WeightScaledLinear(dim_latent, input_nc)
+        
+        self.upsample = False
+        
+    def deconv(self):
+        self.upsample = True
+        return self
+        
+    def forward(self, image, style):
+        batch, input_nc, height, width = image.shape
+        _, output_nc, _, kernel_size, _ = self.weight.shape
+        
+        style = self.modulate(style)
+        weight = self.weight * self.scale * style.view(batch, 1, input_nc, 1, 1)
+        
+        # demodulation
+        demodulate = (self.weight.square().sum([2, 3, 4]) + self.epsilon).rsqrt().view(1, output_nc, 1, 1, 1)
+        weight = weight * demodulate
+        
+        image = image.reshape(1, batch * input_nc, height, width)
+        
+        if not self.upsample:
+            weight = weight.view(batch * output_nc, input_nc, kernel_size, kernel_size)
+            out = F.conv2d(image, weight=weight, bias=None, groups=batch, stride=self.stride, padding=self.padding)
+        else:
+            weight = weight.transpose(1, 2)
+            weight = weight.reshape(batch * input_nc, output_nc, kernel_size, kernel_size)
+            out = F.conv_transpose2d(image, weight=weight, bias=None, groups=batch, stride=self.stride, padding=self.padding)
+        
+        out = out.view(batch, output_nc, out.size(2), out.size(3))
+        
+        return out
+
+
+# In[ ]:
+
+
+class Noise(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1))
+    
+    def forward(self, image):
+        noise = image.new_empty(image.size(0), 1, image.size(2), image.size(3)).normal_()
+        result = image + self.weight * noise
+        return result
+
+
+# In[ ]:
+
+
+class GeneratorBlock(nn.Module):
+    def __init__(self, input_nc, output_nc, n_channel, dim_latent):
+        super().__init__()
+        
+        self.conv1 = ModulatedConv2d(input_nc, output_nc, dim_latent, kernel_size=4, stride=2, padding=1).deconv()  # upsample
+        self.noise1 = Noise()
+        self.normalize1 = PixelwiseNormalization()
+        self.activate1 = FReLU(output_nc)
+        
+        #self.attention = SelfAttention(output_nc)
+        
+        self.conv2 = ModulatedConv2d(output_nc, output_nc, dim_latent, kernel_size=3, stride=1, padding=1)
+        self.noise2 = Noise()
+        self.normalize2 = PixelwiseNormalization()
+        self.activate2 = FReLU(output_nc)
+        
+        self.toRGB = WeightScaledConv2d(output_nc, n_channel, kernel_size=1, stride=1, padding=0)
+        
+    def forward(self, image, style):
+        image = self.conv1(image, style)
+        image = self.noise1(image)
+        image = self.normalize1(image)
+        image = self.activate1(image)
+        
+        #image = self.attention(image)
+        
+        image = self.conv2(image, style)
+        image = self.noise2(image)
+        image = self.normalize2(image)
+        image = self.activate2(image)
+        
+        rgb = self.toRGB(image)
+        
+        return image, rgb
+
+
+# In[ ]:
+
+
+class DiscriminatorBlock(nn.Module):
+    def __init__(self, input_nc, output_nc):
+        super().__init__()
+        
+        self.model = nn.Sequential(
+            WeightScaledConv2d(input_nc, output_nc, kernel_size=4, stride=2, padding=1),  # downsample
+            PixelwiseNormalization(),
+            Mish(),
+            #SelfAttention(output_nc),
+            WeightScaledConv2d(output_nc, output_nc, kernel_size=3, stride=1, padding=1)
+        )
+        
+        self.skip_conv = WeightScaledConv2d(input_nc, output_nc, kernel_size=3, stride=1, padding=1)
+            
+        self.activation = nn.Sequential(
+            PixelwiseNormalization(),
+            Mish()
+        )
+
+
+    def forward(self, x):
+        out = self.model(x)
+        
+        bilinear = F.interpolate(x, mode='bilinear', scale_factor=0.5, align_corners=True, recompute_scale_factor=True)
+        skip = self.skip_conv(bilinear)
+        
+        out = out + skip
+        out = self.activation(out)
+        
+        return out
+
+
+# In[ ]:
+
+
+class MappingNetwork(nn.Module):
+    def __init__(self, dim_latent, num_depth):
+        super().__init__()
+        
+        modules = []
+        
+        for _ in range(num_depth):
+            modules += [WeightScaledLinear(dim_latent, dim_latent)]
+            modules += [PixelwiseNormalization()]
+            modules += [Mish()]
+        
+        self.module = nn.Sequential(*modules)
+        
+    def forward(self, x):
+        x = self.module(x)
+        return x
+
+
+# In[ ]:
+
+
+class Generator(nn.Module):
+    def __init__(self, num_depth, num_fmap, num_mapping, n_channel=3):
+        super().__init__()
+        
+        self.input_size = num_fmap(0)
+        self.register_buffer('const', torch.ones((1, self.input_size, 2, 2), dtype=torch.float32))
+        
+        self.style = MappingNetwork(self.input_size, num_mapping)
+        self.blocks = nn.ModuleList([GeneratorBlock(num_fmap(i), num_fmap(i+1), n_channel, self.input_size) for i in range(num_depth)])
+        
+    def forward(self, styles, input_is_style=False):
+        if not input_is_style:
+            styles = [self.style(z) for z in styles]
+        for _ in range(len(self.blocks) - len(styles)):
+            styles += [styles[-1]]
+        styles = [style.unsqueeze(1) for style in styles]
+        styles = torch.cat(styles, dim=1).to(styles[0].device)
+        
+        x = self.const.expand(styles.size(0), self.input_size, 2, 2)
+        
+        prev_rgb = None
+        for i, block in enumerate(self.blocks):
+            x, rgb = block(x, styles[:,i,:])
+            if prev_rgb is not None:
+                upsampled = F.interpolate(prev_rgb, mode='bilinear', scale_factor=2, align_corners=True, recompute_scale_factor=True)
+                rgb = rgb + upsampled  # Skip Connection
+            prev_rgb = rgb
+        
+        rgb = torch.sigmoid(rgb)
+        
+        return rgb, styles
+
+
+# In[ ]:
+
+
+class Discriminator(nn.Module):
+    def __init__(self, num_depth, num_fmap, n_channel=3):
+        super().__init__()
+        
+        self.fromRGB = WeightScaledConv2d(n_channel, num_fmap(num_depth), kernel_size=1, stride=1, padding=0)
+        self.blocks = nn.ModuleList([DiscriminatorBlock(num_fmap(i+1), num_fmap(i)) for i in range(num_depth)][::-1])
+        
+        # PatchGAN
+        self.conv_last = WeightScaledConv2d(num_fmap(0)+1, 1, kernel_size=3, stride=1, padding=1)
+        
+    def minibatch_standard_deviation(self, x):
+        eps = 1e-8
+        return torch.cat([x, torch.sqrt(((x - x.mean())**2).mean() + eps).expand(x.shape[0], 1, *x.shape[2:])], dim=1)
+    
+    def forward(self, x):
+        x = self.fromRGB(x)
+        
+        for block in self.blocks:
+            x = block(x)
+        
+        x = self.minibatch_standard_deviation(x)
+        out = self.conv_last(x)
+        
+        return out
+
+
+# In[ ]:
+
+
+class Util:
+    @staticmethod
+    def loadImages(batch_size, folder_path, size):
+        imgs = ImageFolder(folder_path, transform=transforms.Compose([
+            transforms.Resize(int(size)),
+            transforms.RandomCrop(size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor()
+        ]))
+        return DataLoader(imgs, batch_size=batch_size, shuffle=True, drop_last=True)
+    
+    @staticmethod
+    def augment(images, p):
+        device = images.device
+        size = images.size(-1)
+        images = [img for img in images.cpu()]
+        images = [transforms.ToPILImage()(img) for img in images]
+        if random.uniform(0, 1) <= p:
+            images = [transforms.ColorJitter(brightness=0, contrast=0.5, saturation=0.5)(img) for img in images]
+        if random.uniform(0, 1) <= p:
+            images = [transforms.RandomRotation(degrees=30)(img) for img in images]
+        images = [transforms.ToTensor()(img) for img in images]
+        images = [transforms.RandomErasing(p=p)(img) for img in images]
+        images = torch.cat([img.unsqueeze(0) for img in images], 0).to(device)
+        return images
+    
+    @staticmethod
+    def showImages(dataloader):
+        get_ipython().run_line_magic('matplotlib', 'inline')
+        import matplotlib.pyplot as plt
+        
+        PIL = transforms.ToPILImage()
+        ToTensor = transforms.ToTensor()
+
+        for images in dataloader:
+            for image in images[0]:
+                img = PIL(image)
+                fig = plt.figure(dpi=200)
+                ax = fig.add_subplot(1, 1, 1) # (row, col, num)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                plt.imshow(img)
+                #plt.gray()
+                plt.show()
+
+
+# In[ ]:
+
+
+class Solver:
+    def __init__(self, args):
+        use_cuda = torch.cuda.is_available() if not args.cpu else False
+        self.device = torch.device("cuda" if use_cuda else "cpu")
+        torch.backends.cudnn.benchmark = True
+        print(f'Use Device: {self.device}')
+        
+        def num_fmap(stage):
+            base_size = self.args.image_size
+            fmap_base = base_size * 4
+            fmap_max = base_size // 2
+            fmap_decay = 1.0
+            return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
+        
+        self.args = args
+        self.feed_dim = num_fmap(0)
+        self.max_depth = int(np.log2(self.args.image_size)) - 1
+        self.ada_prob = args.ada_prob
+        
+        self.netG = Generator(self.max_depth, num_fmap, self.args.num_mapping).to(self.device)
+        self.netD = Discriminator(self.max_depth, num_fmap).to(self.device)
+        self.state_loaded = False
+
+        self.netG.apply(self.weights_init)
+        self.netD.apply(self.weights_init)
+
+        self.optimizer_G = optim.Adam(self.netG.parameters(), lr=self.args.lr, betas=(0, 0.9))
+        self.optimizer_D = optim.Adam(self.netD.parameters(), lr=self.args.lr * self.args.mul_lr_dis, betas=(0, 0.9))
+        #self.scheduler_G = CosineAnnealingLR(self.optimizer_G, T_max=4, eta_min=self.lr/4)
+        #self.scheduler_D = CosineAnnealingLR(self.optimizer_D, T_max=4, eta_min=(self.lr * self.args.mul_lr_dis)/4)
+        
+        self.load_dataset()
+        self.epoch = 0
+    
+    def weights_init(self, module):
+        if type(module) == nn.Linear or type(module) == nn.Conv2d or type(module) == nn.ConvTranspose2d:
+            nn.init.kaiming_normal_(module.weight)
+            if module.bias:
+                module.bias.data.fill_(0)
+            
+    def load_dataset(self):
+        self.dataloader = Util.loadImages(self.args.batch_size, self.args.image_dir, self.args.image_size)
+        self.max_iters = len(iter(self.dataloader))
+            
+    def save_state(self, epoch):
+        self.netG.cpu(), self.netD.cpu()
+        torch.save(self.netG.state_dict(), os.path.join(self.args.weight_dir, f'weight_G.{epoch}.pth'))
+        torch.save(self.netD.state_dict(), os.path.join(self.args.weight_dir, f'weight_D.{epoch}.pth'))
+        self.netG.to(self.device), self.netD.to(self.device)
+        
+    def load_state(self):
+        if (os.path.exists('weight_G.pth') and os.path.exists('weight_D.pth')):
+            self.netG.load_state_dict(torch.load('weight_G.pth', map_location=self.device))
+            self.netD.load_state_dict(torch.load('weight_D.pth', map_location=self.device))
+            self.state_loaded = True
+            print('Loaded network state.')
+    
+    def save_resume(self):
+        with open(os.path.join('.', f'resume.pkl'), 'wb') as f:
+            dump(self, f)
+    
+    def load_resume(self):
+        if os.path.exists('resume.pkl'):
+            with open(os.path.join('.', 'resume.pkl'), 'rb') as f:
+                print('Load resume.')
+                return load(f)
+        else:
+            return self
+        
+    def trainGAN(self, epoch, iters, max_iters, real_img, a=0, b=1, c=1):
+        ### Train with LSGAN.
+        ### for example, (a, b, c) = 0, 1, 1 or (a, b, c) = -1, 1, 0
+        
+        style_feeds = [torch.randn(real_img.size(0), self.feed_dim).to(self.device)]
+        
+        # ================================================================================ #
+        #                             Train the discriminator                              #
+        # ================================================================================ #
+        
+        # Compute loss with real images.
+        real_img_aug = Util.augment(real_img, self.ada_prob)
+        real_src_score = self.netD(real_img_aug)
+        real_src_loss = torch.sum((real_src_score - b) ** 2)
+        
+        # Compute loss with fake images.
+        fake_img, _ = self.netG(style_feeds)
+        fake_img_aug = Util.augment(fake_img, self.ada_prob)
+        fake_src_score = self.netD(fake_img_aug)
+        fake_src_loss = torch.sum((fake_src_score - a) ** 2)
+        
+        # Backward and optimize.
+        d_loss = 0.5 * (real_src_loss + fake_src_loss) / self.args.batch_size
+        self.optimizer_D.zero_grad()
+        d_loss.backward()
+        self.optimizer_D.step()
+        
+        if self.args.ada_prob == 0:
+            self.ada_prob += torch.sign(real_src_score - self.args.ada_d_prob).mean().item() * self.args.batch_size / (max_iters * self.args.ada_length)
+            self.ada_prob = min(1, max(0, self.ada_prob))
+        
+        # Logging.
+        loss = {}
+        loss['D/loss'] = d_loss.item()
+        loss['ADA_prob'] = self.ada_prob
+        
+        # ================================================================================ #
+        #                               Train the generator                                #
+        # ================================================================================ #
+        # Compute loss with reconstruction loss
+        fake_img, styles = self.netG(style_feeds)
+        fake_src_score = self.netD(fake_img)
+        fake_src_loss = torch.sum((fake_src_score - c) ** 2)
+
+        # Compute loss for path regularization
+        noise = torch.randn_like(fake_img) / np.sqrt(fake_img.shape[2] * fake_img.shape[3])
+        grad, = torch.autograd.grad(outputs=(fake_img * noise).sum(), inputs=styles, create_graph=True)
+        path_length = grad.norm(2, dim=2).mean(1)
+        path_mean = self.mean_path_length + 0.01 * (path_length.mean() - self.mean_path_length)
+        path_penalty = (path_length - path_mean).square().mean()
+        self.mean_path_length = path_mean.detach()
+
+        # Backward and optimize.
+        g_loss = 0.5 * fake_src_loss / self.args.batch_size + self.args.lambda_path * path_penalty
+        self.optimizer_G.zero_grad()
+        g_loss.backward()
+        self.optimizer_G.step()
+
+        # Logging.
+        loss['G/loss'] = g_loss.item()
+        loss['G/path_penalty'] = path_penalty.item()
+        
+        # Save
+        if iters == max_iters:
+            self.save_state(epoch)
+            img_name = str(epoch) + '_' + str(iters) + '.png'
+            img_path = os.path.join(self.args.result_dir, img_name)
+            save_image(fake_img, img_path)
+            #Util.showImage(fake_img)
+        
+        return loss
+    
+    def train(self, resume=True):
+        self.netG.train()
+        self.netD.train()
+        
+        while self.args.num_train > self.epoch:
+            self.epoch += 1
+            epoch_loss_G = 0.0
+            epoch_loss_D = 0.0
+            
+            self.mean_path_length = 0
+            for iters, (data, _) in enumerate(tqdm(self.dataloader)):
+                iters += 1
+                
+                data = data.to(self.device)
+                
+                loss = self.trainGAN(self.epoch, iters, self.max_iters, data)
+                
+                epoch_loss_D += loss['D/loss']
+                epoch_loss_G += loss['G/loss']
+                #experiment.log_metrics(loss)
+                
+            #self.scheduler_G.step()
+            #self.scheduler_D.step()
+            
+            epoch_loss = epoch_loss_G + epoch_loss_D
+            
+            print(f'Epoch[{self.epoch}]'
+                  #+ f' LR[G({self.scheduler_G.get_last_lr()[0]:.5f}) D({self.scheduler_D.get_last_lr()[0]:.5f})]'
+                  + f' Loss[G({epoch_loss_G}) + D({epoch_loss_D}) = {epoch_loss}]')
+                    
+            if resume:
+                self.save_resume()
+    
+    def generate(self, num=100):
+        self.netG.eval()
+        
+        for _ in range(num):
+            random_data = [torch.randn(1, self.netG.input_size).to(self.device)]
+            fake_img = self.netG(random_data)[0][0,:]
+            save_image(fake_img, os.path.join(self.args.result_dir, f'generated_{time.time()}.png'))
+            #Util.showImage(fake_img)
+        print('New picture was generated.')
+        
+    def showImages(self):
+        Util.showImages(self.dataloader)
+
+
+# In[ ]:
+
+
+def main(args):
+    hyper_params = {}
+    hyper_params['Image Dir'] = args.image_dir
+    hyper_params['Result Dir'] = args.result_dir
+    hyper_params['Weight Dir'] = args.weight_dir
+    hyper_params['Image Size'] = args.image_size
+    hyper_params['Learning Rate'] = args.lr
+    hyper_params["Mul Discriminator's LR"] = args.mul_lr_dis
+    hyper_params['Batch Size'] = args.batch_size
+    hyper_params['Num Train'] = args.num_train
+    hyper_params['Num Mapping Net'] = args.num_mapping
+    hyper_params['Path Regularize Coef'] = args.lambda_path
+    hyper_params['ADA Length'] = args.ada_length
+    hyper_params['ADA Starts Prob.'] = args.ada_prob
+    hyper_params['ADA Discriminator Prob.'] = args.ada_d_prob
+    
+    solver = Solver(args)
+    solver.load_state()
+    
+    if not args.noresume:
+        solver = solver.load_resume()
+    
+    if args.generate > 0:
+        solver.generate(args.generate)
+        return
+        
+    for key in hyper_params.keys():
+        print(f'{key}: {hyper_params[key]}')
+    #experiment.log_parameters(hyper_params)
+    
+    #solver.showImages()
+    solver.train(not args.noresume)
+    #experiment.end()
+
+
+# In[ ]:
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--image_dir', type=str, default='')
+    parser.add_argument('--result_dir', type=str, default='results')
+    parser.add_argument('--weight_dir', type=str, default='weights')
+    parser.add_argument('--image_size', type=int, default=64)
+    parser.add_argument('--lr', type=float, default=0.0001)
+    parser.add_argument('--mul_lr_dis', type=float, default=2)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--num_train', type=int, default=100)
+    parser.add_argument('--num_mapping', type=int, default=8)
+    parser.add_argument('--lambda_path', type=float, default=2)
+    parser.add_argument('--ada_length', type=int, default=500)
+    parser.add_argument('--ada_prob', type=float, default=0.0)
+    parser.add_argument('--ada_d_prob', type=float, default=0.6)
+    parser.add_argument('--cpu', action='store_true')
+    parser.add_argument('--generate', type=int, default=0)
+    parser.add_argument('--noresume', action='store_true')
+
+    args, unknown = parser.parse_known_args()
+    
+    if not os.path.exists(args.result_dir):
+        os.mkdir(args.result_dir)
+    if not os.path.exists(args.weight_dir):
+        os.mkdir(args.weight_dir)
+    
+    main(args)
+
