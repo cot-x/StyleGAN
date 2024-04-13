@@ -367,7 +367,7 @@ class Util:
     def loadImages(batch_size, folder_path, size):
         imgs = ImageFolder(folder_path, transform=transforms.Compose([
             transforms.Resize(int(size)),
-            transforms.RandomHorizontalFlip(),
+            #transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(size),
             #transforms.RandomRotation(degrees=30),
             #transforms.ColorJitter(brightness=0, contrast=0.5, saturation=0.5),
